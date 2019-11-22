@@ -1,22 +1,37 @@
 package bucketlimiter
 
 import (
+	"errors"
 	"time"
 
 	"gopkg.in/redis.v4"
 )
 
 const script = `
-local key = KEYS[1]
+local key = KEYS[1];
 local now = tonumber(ARGV[1])
 local expiration = tonumber(ARGV[2])
-local rate_limit_info = redis.call("HMGET",key,'last_time','exit_token_num')
-local last_time = tonumber(rate_limit_info[1])
-local exit_token_num = tonumber(rate_limit_info[2])
-
-redis.call('set','test',last_time)
+local tokenNum = tonumber(ARGV[3])
+local rate = tonumber(ARGV[4])
+local consumeTokenNum = tonumber(ARGV[5])
+local rate_limit_info = redis.call('HMGET',key,'last_time','exit_token_num');
+local last_time = now
+local exit_token_num  = tokenNum
+if (rate_limit_info[1]) then
+	last_time = tonumber(rate_limit_info[1])
+	exit_token_num = tonumber(rate_limit_info[2])
+end
+local expectedTokenNum = math.floor(exit_token_num + (now - last_time) / rate)
+expectedTokenNum = math.min(expectedTokenNum,tokenNum)
+if expectedTokenNum < consumeTokenNum then 
+	return 0
+end
+	exit_token_num = expectedTokenNum - consumeTokenNum
+	redis.call("HMSET",key,"last_time",now,"exit_token_num",exit_token_num)
+	redis.call("Expire",key,expiration)
 
 return 1
+
 
 
 `
@@ -54,8 +69,8 @@ func New(redis *redis.Client, key string, setters ...setter) *TokenBucket {
 		redis:      redis,
 		TokenNum:   20,
 		Key:        key,
-		Expiration: 3 * time.Second,
-		Rate:       time.Second,
+		Expiration: 100 * time.Second,
+		Rate:       1 * time.Second,
 	}
 
 	for _, setter := range setters {
@@ -65,6 +80,21 @@ func New(redis *redis.Client, key string, setters ...setter) *TokenBucket {
 	return &tokenBucket
 }
 
-func Consume(num int64) bool {
-	return false
+func (tokenBucket *TokenBucket) Consume(num int64) (bool, error) {
+	ret, err := tokenBucket.redis.Eval(script,
+		[]string{tokenBucket.Key},
+		time.Now().UnixNano()/int64(time.Millisecond),
+		tokenBucket.Expiration.Seconds(),
+		tokenBucket.TokenNum,
+		int64(tokenBucket.Rate/time.Millisecond),
+		num,
+	).Result()
+	if err != nil {
+		return false, err
+	}
+	res, ok := ret.(int64)
+	if !ok {
+		return false, errors.New("unkonwn error")
+	}
+	return res == 1, nil
 }
